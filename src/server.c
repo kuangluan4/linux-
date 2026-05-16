@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <asm-generic/fcntl.h>
+#include <stdint.h>
 
 #define PORT 8888
 #define BUF_SIZE 1024
@@ -56,25 +57,65 @@ int main(void){
     int client_port = ntohs(client_addr.sin_port);//字节从网络-》主机
     printf("client connected: %s:%d\n",client_ip,client_port);
 
-    char buf[BUF_SIZE];
+    char filename[256] = {0};//初始化a全为0
+    int i = 0;
     
-    while(1){
-        memset(buf,0,sizeof(buf));
-        int len = recv(cfd,buf,BUF_SIZE - 1,0);
-        //最后一个参数是flags，0表示默认行为
-        if (len <= 0){
-            if (len == 0) {
-                printf("客户端正常关闭连接\n");
-            } 
-            else {
-                perror("recv");
-            }
-            break;   // 退出循环，关闭当前连接
+    while(i<sizeof(filename) - 1){
+        char c;
+        int n = recv(cfd,&c,1,0);
+        //第三个参数是接收的字节数，这里是1个字节
+        if(n <=0){
+            printf("server failed to receive file\n");
+            close(cfd);
+            close(lfd);
+            return -1;
         }
-        printf("message from client:%s\n",buf);
-        const char *reply = "hello from server!";
-        send(cfd,reply,strlen(reply),0);
+        if(c == '\n')break;//这里指 文件名e结尾是\n
+        filename[i++] = c;
     }
+    filename[i] = '0';
+    printf("filename: %s\n",filename);
+//uint32_t是无符号32位整数类型，file_size_net是网络字节序的文件大小
+//recv函数接收数据，参数分别是：socket描述符、接收缓冲区、接收字节数、标志
+//发送前用htonl将主机字节序的文件大小转换为网络字节序，接收时用ntohl将网络字节序转换为主机字节序
+    uint32_t file_size_net;
+    int n = recv(cfd,&file_size_net,sizeof(file_size_net),0);
+    if(n != sizeof(file_size_net)){
+        printf("server failed to receive file size\n");
+        close(cfd);
+        close(lfd);
+        return -1;
+    }
+    uint32_t file_size = ntohl(file_size_net);
+    //转化为主机字节
+
+    char save_name[512];
+    sprintf(save_name,"recv_%s",filename);
+    FILE *fp = fopen(save_name,"wb");
+    //文件以二进制写入的方式打开
+    if(fp == NULL){
+        perror("fopen");
+        close(cfd);
+        close(lfd);
+        return -1;
+    }
+
+    uint32_t received = 0;
+    char buf[BUF_SIZE];
+    while(received <file_size){
+        int need  = (file_size - received) > BUF_SIZE ?BUF_SIZE : (file_size - received);
+        int n = recv(cfd,buf,need,0);
+        if(n <= 0){
+            printf("server failed to receive file data\n");
+            break;
+        }
+        fwrite(buf,1,n,fp);
+        received += n;//移动n个字节
+        printf("received %u/%u bytes\r",received,file_size);
+        fflush(stdout);//刷新输出缓冲区，确保进度信息及时显示   
+    }
+    printf("\nfile received sucess\n");
+    fclose(fp);
 
     close(cfd);
     close(lfd);
