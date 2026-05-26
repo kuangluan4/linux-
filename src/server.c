@@ -6,121 +6,367 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <asm-generic/fcntl.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <errno.h>
+#include <signal.h>
 
 #define PORT 8888
 #define BUF_SIZE 1024
 #define MAX_CLIENTS 100
+#define THREAD_POOL_SIZE 4
 
-int main(void){
-    int lfd = socket(AF_INET,SOCK_STREAM,0);
-    if(lfd == -1){
+#define MODE_UPLOAD   1
+#define MODE_DOWNLOAD 2
+
+pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    int cfd;
+    char client_ip[16];
+    int client_port;
+} task_t;
+
+task_t task_queue[256];
+int queue_front = 0, queue_rear = 0;
+int queue_count = 0;
+
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+
+volatile int server_running = 1;
+
+void create_directories() {
+    if (mkdir("server_files", 0755) == -1 && errno != EEXIST) {
+        perror("mkdir server_files");
+        exit(1);
+    }
+    if (mkdir("logs", 0755) == -1 && errno != EEXIST) {
+        perror("mkdir logs");
+        exit(1);
+    }
+}
+
+void write_log(const char *client_ip, const char *org_filename,
+    const char *action, const char *detail, uint32_t file_size) {
+    pthread_mutex_lock(&log_mutex);
+    FILE *log = fopen("logs/transfer.log", "a");
+    if (log == NULL) {
+        perror("fopen log");
+    } else {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        fprintf(log, "%04d-%02d-%02d %02d:%02d:%02d - %s %s %s (%u bytes) %s\n",
+            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+            t->tm_hour, t->tm_min, t->tm_sec,
+            client_ip, action, org_filename, file_size, detail);
+        fclose(log);
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
+static void skip_bytes(int cfd, uint32_t count) {
+    char discard[BUF_SIZE];
+    while (count > 0) {
+        int n = recv(cfd, discard, count > BUF_SIZE ? BUF_SIZE : count, 0);
+        if (n <= 0) break;
+        count -= n;
+    }
+}
+
+void handle_upload(int cfd, const char *client_ip) {
+    uint32_t file_count_net;
+    int ret = recv(cfd, &file_count_net, sizeof(file_count_net), 0);
+    if (ret != sizeof(file_count_net)) {
+        pthread_mutex_lock(&print_mutex);
+        printf("Failed to receive file count\n");
+        pthread_mutex_unlock(&print_mutex);
+        return;
+    }
+    uint32_t file_count = ntohl(file_count_net);
+
+    pthread_mutex_lock(&print_mutex);
+    printf("Receiving %u files from %s\n", file_count, client_ip);
+    pthread_mutex_unlock(&print_mutex);
+
+    for (uint32_t file_idx = 0; file_idx < file_count; file_idx++) {
+        char filename[256] = {0};
+        int i = 0;
+        while (i < (int)sizeof(filename) - 1) {
+            char c;
+            int n = recv(cfd, &c, 1, 0);
+            if (n <= 0) {
+                pthread_mutex_lock(&print_mutex);
+                printf("Failed to receive filename\n");
+                pthread_mutex_unlock(&print_mutex);
+                return;
+            }
+            if (c == '\n') break;
+            filename[i++] = c;
+        }
+        filename[i] = '\0';
+
+        // Sanitize: strip path, keep only basename
+        const char *safe_name = strrchr(filename, '/');
+        if (safe_name) safe_name++;
+        else safe_name = filename;
+
+        uint32_t file_size_net;
+        ret = recv(cfd, &file_size_net, sizeof(file_size_net), 0);
+        if (ret != sizeof(file_size_net)) {
+            pthread_mutex_lock(&print_mutex);
+            printf("Failed to receive file size\n");
+            pthread_mutex_unlock(&print_mutex);
+            return;
+        }
+        uint32_t file_size = ntohl(file_size_net);
+
+        char save_name[512];
+        snprintf(save_name, sizeof(save_name), "server_files/%s", safe_name);
+        FILE *fp = fopen(save_name, "wb");
+        if (fp == NULL) {
+            perror("fopen");
+            skip_bytes(cfd, file_size);
+            continue;
+        }
+
+        uint32_t received = 0;
+        char buf[BUF_SIZE];
+        while (received < file_size) {
+            int need = (file_size - received) > BUF_SIZE ? BUF_SIZE : (file_size - received);
+            int n = recv(cfd, buf, need, 0);
+            if (n <= 0) {
+                pthread_mutex_lock(&print_mutex);
+                printf("Failed to receive file data\n");
+                pthread_mutex_unlock(&print_mutex);
+                break;
+            }
+            fwrite(buf, 1, n, fp);
+            received += n;
+            pthread_mutex_lock(&print_mutex);
+            printf("Received %u/%u bytes\r", received, file_size);
+            fflush(stdout);
+            pthread_mutex_unlock(&print_mutex);
+        }
+        printf("\n");
+        fclose(fp);
+        write_log(client_ip, safe_name, "uploaded", save_name, file_size);
+    }
+}
+
+void handle_download(int cfd, const char *client_ip) {
+    uint32_t file_count_net;
+    int ret = recv(cfd, &file_count_net, sizeof(file_count_net), 0);
+    if (ret != sizeof(file_count_net)) {
+        pthread_mutex_lock(&print_mutex);
+        printf("Failed to receive download file count\n");
+        pthread_mutex_unlock(&print_mutex);
+        return;
+    }
+    uint32_t file_count = ntohl(file_count_net);
+
+    pthread_mutex_lock(&print_mutex);
+    printf("Client %s requests %u files for download\n", client_ip, file_count);
+    pthread_mutex_unlock(&print_mutex);
+
+    for (uint32_t i = 0; i < file_count; i++) {
+        char filename[256] = {0};
+        int j = 0;
+        while (j < (int)sizeof(filename) - 1) {
+            char c;
+            int n = recv(cfd, &c, 1, 0);
+            if (n <= 0) return;
+            if (c == '\n') break;
+            filename[j++] = c;
+        }
+        filename[j] = '\0';
+
+        // Sanitize: strip path, keep only basename
+        const char *safe_name = strrchr(filename, '/');
+        if (safe_name) safe_name++;
+        else safe_name = filename;
+
+        char filepath[512];
+        snprintf(filepath, sizeof(filepath), "server_files/%s", safe_name);
+
+        FILE *fp = fopen(filepath, "rb");
+        if (fp == NULL) {
+            uint32_t status = htonl(1);
+            send(cfd, &status, sizeof(status), 0);
+            pthread_mutex_lock(&print_mutex);
+            printf("Download: %s not found\n", safe_name);
+            pthread_mutex_unlock(&print_mutex);
+            continue;
+        }
+
+        fseek(fp, 0, SEEK_END);
+        long file_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+
+        uint32_t status = htonl(0);
+        send(cfd, &status, sizeof(status), 0);
+
+        uint32_t size_net = htonl((uint32_t)file_size);
+        send(cfd, &size_net, sizeof(size_net), 0);
+
+        char buf[BUF_SIZE];
+        size_t sent = 0;
+        while (sent < (size_t)file_size) {
+            size_t need = (file_size - sent) > BUF_SIZE ? BUF_SIZE : (file_size - sent);
+            size_t nr = fread(buf, 1, need, fp);
+            if (nr == 0) break;
+            int ns = send(cfd, buf, nr, 0);
+            if (ns <= 0) break;
+            sent += ns;
+        }
+        fclose(fp);
+
+        pthread_mutex_lock(&print_mutex);
+        printf("Sent %s (%ld bytes) to %s\n", safe_name, file_size, client_ip);
+        pthread_mutex_unlock(&print_mutex);
+        write_log(client_ip, safe_name, "downloaded", client_ip, (uint32_t)file_size);
+    }
+}
+
+void *handle_client(void *arg) {
+    task_t *task = (task_t *)arg;
+    int cfd = task->cfd;
+    char client_ip[16];
+    strcpy(client_ip, task->client_ip);
+    int client_port = task->client_port;
+    free(task);
+
+    uint32_t mode_net;
+    int n = recv(cfd, &mode_net, sizeof(mode_net), 0);
+    if (n != sizeof(mode_net)) {
+        pthread_mutex_lock(&print_mutex);
+        printf("Failed to receive mode from %s:%d\n", client_ip, client_port);
+        pthread_mutex_unlock(&print_mutex);
+        close(cfd);
+        return NULL;
+    }
+    uint32_t mode = ntohl(mode_net);
+
+    if (mode == MODE_UPLOAD) {
+        handle_upload(cfd, client_ip);
+    } else if (mode == MODE_DOWNLOAD) {
+        handle_download(cfd, client_ip);
+    } else {
+        pthread_mutex_lock(&print_mutex);
+        printf("Unknown mode %u from %s:%d\n", mode, client_ip, client_port);
+        pthread_mutex_unlock(&print_mutex);
+    }
+
+    close(cfd);
+    return NULL;
+}
+
+void *worker_thread(void *arg) {
+    (void)arg;
+    while (server_running) {
+        pthread_mutex_lock(&queue_mutex);
+        while (queue_count == 0 && server_running) {
+            pthread_cond_wait(&queue_cond, &queue_mutex);
+        }
+        if (!server_running) {
+            pthread_mutex_unlock(&queue_mutex);
+            break;
+        }
+        task_t t = task_queue[queue_front];
+        queue_front = (queue_front + 1) % 256;
+        queue_count--;
+        pthread_mutex_unlock(&queue_mutex);
+
+        task_t *task_ptr = (task_t *)malloc(sizeof(task_t));
+        *task_ptr = t;
+        handle_client(task_ptr);
+    }
+    return NULL;
+}
+
+void sigint_handler(int sig) {
+    if (sig == SIGINT) {
+        server_running = 0;
+        pthread_cond_broadcast(&queue_cond);
+    }
+}
+
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, sigint_handler);
+    create_directories();
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd == -1) {
         perror("socket");
         return -1;
-    }//创建socket失败
-    printf("socket created sucessfully\n");
+    }
+    printf("Socket created successfully\n");
 
     struct sockaddr_in server_addr;
-    memset(&server_addr,0,sizeof(server_addr));
-    server_addr.sin_family = AF_INET;//ipv4;
-    server_addr.sin_port = htons(PORT);//要经过网络传输，所以要转换成网络字节序
-    inet_pton(AF_INET,"0.0.0.0",&server_addr.sin_addr);
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    inet_pton(AF_INET, "0.0.0.0", &server_addr.sin_addr);
 
-    int ret = bind(lfd,(struct sockaddr*)&server_addr,sizeof(server_addr));
-    if(ret == -1){
+    int ret = bind(lfd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    if (ret == -1) {
         perror("bind");
         return -1;
     }
-    printf("bind sucessfully\n");
+    printf("Bind successfully\n");
 
-    ret = listen(lfd,MAX_CLIENTS);
-    if(ret == -1){
+    ret = listen(lfd, MAX_CLIENTS);
+    if (ret == -1) {
         perror("listen");
         return -1;
     }
-    printf("listen sucessfully\n");
+    printf("Listen successfully\n");
 
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    int cfd = accept(lfd,(struct sockaddr*)&client_addr,&client_addr_len);
-    if(cfd == -1){
-        perror("accept");
-        close(lfd);
-        return -1;
+    pthread_t workers[THREAD_POOL_SIZE];
+    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+        pthread_create(&workers[i], NULL, worker_thread, NULL);
     }
-    printf("accept sucessfully\n");
 
-    char client_ip[16];
-    inet_ntop(AF_INET,&client_addr.sin_addr,client_ip,sizeof(client_ip));
-    //ip放到client_ip中，sizeof(client_ip)是为了防止越界
-    int client_port = ntohs(client_addr.sin_port);//字节从网络-》主机
-    printf("client connected: %s:%d\n",client_ip,client_port);
+    while (server_running) {
+        struct sockaddr_in client_addr;
+        socklen_t client_addr_len = sizeof(client_addr);
+        int cfd = accept(lfd, (struct sockaddr*)&client_addr, &client_addr_len);
+        if (cfd == -1) {
+            if (server_running) perror("accept");
+            continue;
+        }
 
-    char filename[256] = {0};//初始化a全为0
-    int i = 0;
-    
-    while(i<sizeof(filename) - 1){
-        char c;
-        int n = recv(cfd,&c,1,0);
-        //第三个参数是接收的字节数，这里是1个字节
-        if(n <=0){
-            printf("server failed to receive file\n");
+        char client_ip[16];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        int client_port = ntohs(client_addr.sin_port);
+        printf("Client connected: %s:%d\n", client_ip, client_port);
+
+        task_t new_task;
+        new_task.cfd = cfd;
+        strcpy(new_task.client_ip, client_ip);
+        new_task.client_ip[sizeof(new_task.client_ip) - 1] = '\0';
+        new_task.client_port = client_port;
+
+        pthread_mutex_lock(&queue_mutex);
+        if (queue_count < 256) {
+            task_queue[queue_rear] = new_task;
+            queue_rear = (queue_rear + 1) % 256;
+            queue_count++;
+            pthread_cond_signal(&queue_cond);
+        } else {
+            printf("Task queue full, rejecting %s:%d\n", client_ip, client_port);
             close(cfd);
-            close(lfd);
-            return -1;
         }
-        if(c == '\n')break;//这里指 文件名e结尾是\n
-        filename[i++] = c;
-    }
-    filename[i] = '0';
-    printf("filename: %s\n",filename);
-//uint32_t是无符号32位整数类型，file_size_net是网络字节序的文件大小
-//recv函数接收数据，参数分别是：socket描述符、接收缓冲区、接收字节数、标志
-//发送前用htonl将主机字节序的文件大小转换为网络字节序，接收时用ntohl将网络字节序转换为主机字节序
-    uint32_t file_size_net;
-    int n = recv(cfd,&file_size_net,sizeof(file_size_net),0);
-    if(n != sizeof(file_size_net)){
-        printf("server failed to receive file size\n");
-        close(cfd);
-        close(lfd);
-        return -1;
-    }
-    uint32_t file_size = ntohl(file_size_net);
-    //转化为主机字节
-
-    char save_name[512];
-    sprintf(save_name,"recv_%s",filename);
-    FILE *fp = fopen(save_name,"wb");
-    //文件以二进制写入的方式打开
-    if(fp == NULL){
-        perror("fopen");
-        close(cfd);
-        close(lfd);
-        return -1;
+        pthread_mutex_unlock(&queue_mutex);
     }
 
-    uint32_t received = 0;
-    char buf[BUF_SIZE];
-    while(received <file_size){
-        int need  = (file_size - received) > BUF_SIZE ?BUF_SIZE : (file_size - received);
-        int n = recv(cfd,buf,need,0);
-        if(n <= 0){
-            printf("server failed to receive file data\n");
-            break;
-        }
-        fwrite(buf,1,n,fp);
-        received += n;//移动n个字节
-        printf("received %u/%u bytes\r",received,file_size);
-        fflush(stdout);//刷新输出缓冲区，确保进度信息及时显示   
+    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+        pthread_join(workers[i], NULL);
     }
-    printf("\nfile received sucess\n");
-    fclose(fp);
-
-    close(cfd);
+    printf("Server shut down.\n");
     close(lfd);
-    printf("server closed\n");
-
     return 0;
 }
-

@@ -5,74 +5,186 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <pthread.h>
-#include <asm-generic/fcntl.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define PORT 8888
 #define BUF_SIZE 1024
 
-int main(void){
-    const char *local_filename = "src/test.txt";
-    FILE *fp = fopen(local_filename,"rb");
-    if(fp == NULL){
-        perror("open file fail");
-        return -1;
+#define MODE_UPLOAD   1
+#define MODE_DOWNLOAD 2
+
+void run_upload(int cfd) {
+    const char *files[] = {"client_files/test.txt", "client_files/test.dat", NULL};
+    int file_count = 0;
+    while (files[file_count] != NULL) file_count++;
+
+    uint32_t mode_net = htonl(MODE_UPLOAD);
+    send(cfd, &mode_net, sizeof(mode_net), 0);
+
+    uint32_t count_net = htonl(file_count);
+    send(cfd, &count_net, sizeof(count_net), 0);
+
+    for (int i = 0; i < file_count; i++) {
+        const char *path = files[i];
+        const char *filename = strrchr(path, '/');
+        if (filename == NULL) filename = path;
+        else filename++;
+
+        FILE *fp = fopen(path, "rb");
+        if (fp == NULL) {
+            perror("fopen");
+            continue;
+        }
+        fseek(fp, 0, SEEK_END);
+        long file_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+
+        send(cfd, filename, strlen(filename), 0);
+        send(cfd, "\n", 1, 0);
+
+        uint32_t size_net = htonl((uint32_t)file_size);
+        send(cfd, &size_net, sizeof(size_net), 0);
+
+        char buf[BUF_SIZE];
+        size_t send_total = 0;
+        while (send_total < (size_t)file_size) {
+            size_t need = (file_size - send_total) > BUF_SIZE ? BUF_SIZE : (file_size - send_total);
+            size_t n = fread(buf, 1, need, fp);
+            if (n == 0) break;
+            int s = send(cfd, buf, n, 0);
+            if (s <= 0) {
+                perror("send");
+                break;
+            }
+            send_total += s;
+            printf("Sent: %zu / %ld bytes\r", send_total, file_size);
+            fflush(stdout);
+        }
+        printf("\nFile sent: %s\n", filename);
+        fclose(fp);
+    }
+}
+
+void run_download(int cfd) {
+    const char *files[] = {"test.txt", "test.dat", NULL};
+    int file_count = 0;
+    while (files[file_count] != NULL) file_count++;
+
+    if (mkdir("client_files", 0755) == -1 && errno != EEXIST) {
+        perror("mkdir client_files");
+        return;
     }
 
-    fseek(fp,0,SEEK_END);
-    long file_size = ftell(fp);
-    fseek(fp,0,SEEK_SET);
-    //fseek和ftell函数用于获取文件大小，首先将文件指针移动到文件末尾，然后使用ftell获取当前文件指针的位置，即文件大小，最后将文件指针重新移动到文件开头
+    uint32_t mode_net = htonl(MODE_DOWNLOAD);
+    send(cfd, &mode_net, sizeof(mode_net), 0);
 
-    int cfd = socket(AF_INET,SOCK_STREAM,0);
-    if(cfd == -1){
+    uint32_t count_net = htonl(file_count);
+    send(cfd, &count_net, sizeof(count_net), 0);
+
+    for (int i = 0; i < file_count; i++) {
+        const char *filename = files[i];
+
+        send(cfd, filename, strlen(filename), 0);
+        send(cfd, "\n", 1, 0);
+
+        uint32_t status_net;
+        int n = recv(cfd, &status_net, sizeof(status_net), 0);
+        if (n != sizeof(status_net)) {
+            printf("Failed to receive status for %s\n", filename);
+            return;
+        }
+        if (ntohl(status_net) != 0) {
+            printf("File not found on server: %s\n", filename);
+            continue;
+        }
+
+        uint32_t size_net;
+        n = recv(cfd, &size_net, sizeof(size_net), 0);
+        if (n != sizeof(size_net)) {
+            printf("Failed to receive file size for %s\n", filename);
+            return;
+        }
+        uint32_t file_size = ntohl(size_net);
+
+        char save_path[512];
+        snprintf(save_path, sizeof(save_path), "client_files/%s", filename);
+        FILE *fp = fopen(save_path, "wb");
+        if (fp == NULL) {
+            perror("fopen");
+            // Discard incoming data
+            char discard[BUF_SIZE];
+            uint32_t left = file_size;
+            while (left > 0) {
+                int nr = recv(cfd, discard, left > BUF_SIZE ? BUF_SIZE : left, 0);
+                if (nr <= 0) break;
+                left -= nr;
+            }
+            continue;
+        }
+
+        char buf[BUF_SIZE];
+        uint32_t received = 0;
+        while (received < file_size) {
+            int need = (file_size - received) > BUF_SIZE ? BUF_SIZE : (file_size - received);
+            int nr = recv(cfd, buf, need, 0);
+            if (nr <= 0) {
+                printf("Failed to receive data for %s\n", filename);
+                break;
+            }
+            fwrite(buf, 1, nr, fp);
+            received += nr;
+            printf("Downloaded: %u / %u bytes\r", received, file_size);
+            fflush(stdout);
+        }
+        printf("\nFile downloaded: %s -> %s\n", filename, save_path);
+        fclose(fp);
+    }
+}
+
+int main(void) {
+    if (mkdir("client_files", 0755) == -1 && errno != EEXIST) {
+        perror("mkdir client_files");
+    }
+
+    int cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (cfd == -1) {
         perror("socket");
         return -1;
     }
-    printf("socket created sucessfully!\n");
+    printf("Socket created successfully!\n");
 
     struct sockaddr_in server_addr;
-    memset(&server_addr,0,sizeof(server_addr));
+    memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET,"127.0.0.1",&server_addr.sin_addr);
-//回环地址，表示连接到本机
-    int ret = connect(cfd,(struct sockaddr*)&server_addr,sizeof(server_addr));
-    if(ret == -1){
+    inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
+
+    int ret = connect(cfd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    if (ret == -1) {
         perror("connect");
         close(cfd);
         return -1;
     }
-    printf("connect to server sucessfully\n");
+    printf("Connected to server successfully\n");
 
-    const char *filename_only = "test.txt";
-    send(cfd,filename_only,strlen(filename_only),0);
-    send(cfd,"\n",1,0);
-
-    uint32_t file_size_net = htonl(file_size);
-    //网络字节序，后面server端用ntohl转换成主机字节序
-    send(cfd,&file_size_net,sizeof(file_size_net),0);
-
-        char buf[BUF_SIZE];
-    size_t send_total = 0;
-    while (send_total < file_size) {
-        size_t need = (file_size - send_total) > BUF_SIZE ? BUF_SIZE : (file_size - send_total);
-        size_t n = fread(buf, 1, need, fp);
-        if (n == 0) break;
-        int s = send(cfd, buf, n, 0);
-        if (s <= 0) {
-            perror("send");
-            break;
-        }
-        send_total += s;
-        printf("已发送: %zu / %ld 字节\r", send_total, file_size);
-        fflush(stdout);
+    int mode;
+    printf("Select mode: 1=Upload, 2=Download: ");
+    if (scanf("%d", &mode) != 1) {
+        printf("Invalid input\n");
+        close(cfd);
+        return -1;
     }
-    printf("\n文件发送完成！\n");
+
+    if (mode == MODE_UPLOAD) {
+        run_upload(cfd);
+    } else if (mode == MODE_DOWNLOAD) {
+        run_download(cfd);
+    } else {
+        printf("Invalid mode\n");
+    }
 
     close(cfd);
     return 0;
-
-    
 }
