@@ -108,7 +108,6 @@ void handle_upload(int cfd, const char *client_ip) {
         }
         filename[i] = '\0';
 
-        // Sanitize: strip path, keep only basename
         const char *safe_name = strrchr(filename, '/');
         if (safe_name) safe_name++;
         else safe_name = filename;
@@ -125,34 +124,63 @@ void handle_upload(int cfd, const char *client_ip) {
 
         char save_name[512];
         snprintf(save_name, sizeof(save_name), "server_files/%s", safe_name);
-        FILE *fp = fopen(save_name, "wb");
-        if (fp == NULL) {
-            perror("fopen");
-            skip_bytes(cfd, file_size);
+
+        // Check for existing partial file
+        uint32_t existing = 0;
+        struct stat st;
+        if (stat(save_name, &st) == 0) {
+            if ((uint32_t)st.st_size < file_size) {
+                existing = (uint32_t)st.st_size;
+            } else if ((uint32_t)st.st_size > file_size) {
+                // File on disk is larger than expected, remove and restart
+                remove(save_name);
+            }
+        }
+
+        // Tell client how many bytes we already have
+        uint32_t existing_net = htonl(existing);
+        send(cfd, &existing_net, sizeof(existing_net), 0);
+
+        if (existing >= file_size) {
+            pthread_mutex_lock(&print_mutex);
+            printf("File %s already complete, skipped\n", safe_name);
+            pthread_mutex_unlock(&print_mutex);
             continue;
         }
 
+        FILE *fp = fopen(save_name, existing > 0 ? "ab" : "wb");
+        if (fp == NULL) {
+            perror("fopen");
+            skip_bytes(cfd, file_size - existing);
+            continue;
+        }
+
+        uint32_t remaining = file_size - existing;
         uint32_t received = 0;
         char buf[BUF_SIZE];
-        while (received < file_size) {
-            int need = (file_size - received) > BUF_SIZE ? BUF_SIZE : (file_size - received);
+        while (received < remaining) {
+            int need = (remaining - received) > BUF_SIZE ? BUF_SIZE : (remaining - received);
             int n = recv(cfd, buf, need, 0);
             if (n <= 0) {
                 pthread_mutex_lock(&print_mutex);
-                printf("Failed to receive file data\n");
+                printf("Transfer interrupted at %u/%u bytes (can resume later)\n",
+                    existing + received, file_size);
                 pthread_mutex_unlock(&print_mutex);
                 break;
             }
             fwrite(buf, 1, n, fp);
             received += n;
             pthread_mutex_lock(&print_mutex);
-            printf("Received %u/%u bytes\r", received, file_size);
+            printf("Received %u/%u bytes\r", existing + received, file_size);
             fflush(stdout);
             pthread_mutex_unlock(&print_mutex);
         }
         printf("\n");
         fclose(fp);
-        write_log(client_ip, safe_name, "uploaded", save_name, file_size);
+
+        if (existing + received >= file_size) {
+            write_log(client_ip, safe_name, "uploaded", save_name, file_size);
+        }
     }
 }
 
@@ -183,7 +211,6 @@ void handle_download(int cfd, const char *client_ip) {
         }
         filename[j] = '\0';
 
-        // Sanitize: strip path, keep only basename
         const char *safe_name = strrchr(filename, '/');
         if (safe_name) safe_name++;
         else safe_name = filename;
@@ -211,22 +238,52 @@ void handle_download(int cfd, const char *client_ip) {
         uint32_t size_net = htonl((uint32_t)file_size);
         send(cfd, &size_net, sizeof(size_net), 0);
 
+        // Receive client's existing bytes (for resume)
+        uint32_t existing_net;
+        ret = recv(cfd, &existing_net, sizeof(existing_net), 0);
+        if (ret != sizeof(existing_net)) {
+            fclose(fp);
+            return;
+        }
+        uint32_t existing = ntohl(existing_net);
+
+        if (existing >= (uint32_t)file_size) {
+            pthread_mutex_lock(&print_mutex);
+            printf("Client already has complete %s, skipped\n", safe_name);
+            pthread_mutex_unlock(&print_mutex);
+            fclose(fp);
+            continue;
+        }
+
+        fseek(fp, existing, SEEK_SET);
+        long remaining = file_size - existing;
+
         char buf[BUF_SIZE];
         size_t sent = 0;
-        while (sent < (size_t)file_size) {
-            size_t need = (file_size - sent) > BUF_SIZE ? BUF_SIZE : (file_size - sent);
+        while (sent < (size_t)remaining) {
+            size_t need = (remaining - sent) > BUF_SIZE ? BUF_SIZE : (remaining - sent);
             size_t nr = fread(buf, 1, need, fp);
             if (nr == 0) break;
             int ns = send(cfd, buf, nr, 0);
-            if (ns <= 0) break;
+            if (ns <= 0) {
+                pthread_mutex_lock(&print_mutex);
+                printf("Transfer interrupted at %lu/%lu bytes (can resume later)\n",
+                    existing + sent, file_size);
+                pthread_mutex_unlock(&print_mutex);
+                break;
+            }
             sent += ns;
         }
         fclose(fp);
 
         pthread_mutex_lock(&print_mutex);
-        printf("Sent %s (%ld bytes) to %s\n", safe_name, file_size, client_ip);
+        printf("Sent %s (%lu/%ld bytes) to %s\n",
+            safe_name, existing + sent, file_size, client_ip);
         pthread_mutex_unlock(&print_mutex);
-        write_log(client_ip, safe_name, "downloaded", client_ip, (uint32_t)file_size);
+
+        if (existing + sent >= (size_t)file_size) {
+            write_log(client_ip, safe_name, "downloaded", client_ip, (uint32_t)file_size);
+        }
     }
 }
 

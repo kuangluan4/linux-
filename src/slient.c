@@ -47,10 +47,32 @@ void run_upload(int cfd) {
         uint32_t size_net = htonl((uint32_t)file_size);
         send(cfd, &size_net, sizeof(size_net), 0);
 
+        // Receive existing bytes from server for resume
+        uint32_t existing_net;
+        int ret = recv(cfd, &existing_net, sizeof(existing_net), 0);
+        if (ret != sizeof(existing_net)) {
+            printf("Failed to receive existing bytes for %s\n", filename);
+            fclose(fp);
+            return;
+        }
+        uint32_t existing = ntohl(existing_net);
+
+        if (existing >= (uint32_t)file_size) {
+            printf("File %s already complete on server, skipped\n", filename);
+            fclose(fp);
+            continue;
+        }
+
+        if (existing > 0) {
+            printf("Resuming upload from byte %u/%ld\n", existing, file_size);
+            fseek(fp, existing, SEEK_SET);
+        }
+
+        long remaining = file_size - existing;
         char buf[BUF_SIZE];
         size_t send_total = 0;
-        while (send_total < (size_t)file_size) {
-            size_t need = (file_size - send_total) > BUF_SIZE ? BUF_SIZE : (file_size - send_total);
+        while (send_total < (size_t)remaining) {
+            size_t need = (remaining - send_total) > BUF_SIZE ? BUF_SIZE : (remaining - send_total);
             size_t n = fread(buf, 1, need, fp);
             if (n == 0) break;
             int s = send(cfd, buf, n, 0);
@@ -59,7 +81,7 @@ void run_upload(int cfd) {
                 break;
             }
             send_total += s;
-            printf("Sent: %zu / %ld bytes\r", send_total, file_size);
+            printf("Sent: %zu / %ld bytes\r", existing + send_total, file_size);
             fflush(stdout);
         }
         printf("\nFile sent: %s\n", filename);
@@ -68,7 +90,7 @@ void run_upload(int cfd) {
 }
 
 void run_download(int cfd) {
-    const char *files[] = {"test.txt", "test.dat", NULL};
+    const char *files[] = {"test.txt", "123.dat", NULL};
     int file_count = 0;
     while (files[file_count] != NULL) file_count++;
 
@@ -110,12 +132,33 @@ void run_download(int cfd) {
 
         char save_path[512];
         snprintf(save_path, sizeof(save_path), "client_files/%s", filename);
-        FILE *fp = fopen(save_path, "wb");
+
+        // Check for existing partial file
+        uint32_t existing = 0;
+        struct stat st;
+        if (stat(save_path, &st) == 0 && (uint32_t)st.st_size < file_size) {
+            existing = (uint32_t)st.st_size;
+        }
+
+        // Send existing bytes to server for resume
+        uint32_t existing_net = htonl(existing);
+        send(cfd, &existing_net, sizeof(existing_net), 0);
+
+        if (existing >= file_size) {
+            printf("File %s already complete, skipped\n", filename);
+            continue;
+        }
+
+        if (existing > 0) {
+            printf("Resuming download from byte %u/%u\n", existing, file_size);
+        }
+
+        FILE *fp = fopen(save_path, existing > 0 ? "ab" : "wb");
         if (fp == NULL) {
             perror("fopen");
             // Discard incoming data
             char discard[BUF_SIZE];
-            uint32_t left = file_size;
+            uint32_t left = file_size - existing;
             while (left > 0) {
                 int nr = recv(cfd, discard, left > BUF_SIZE ? BUF_SIZE : left, 0);
                 if (nr <= 0) break;
@@ -126,16 +169,18 @@ void run_download(int cfd) {
 
         char buf[BUF_SIZE];
         uint32_t received = 0;
-        while (received < file_size) {
-            int need = (file_size - received) > BUF_SIZE ? BUF_SIZE : (file_size - received);
+        uint32_t remaining = file_size - existing;
+        while (received < remaining) {
+            int need = (remaining - received) > BUF_SIZE ? BUF_SIZE : (remaining - received);
             int nr = recv(cfd, buf, need, 0);
             if (nr <= 0) {
-                printf("Failed to receive data for %s\n", filename);
+                printf("Transfer interrupted at %u/%u bytes (can resume later)\n",
+                    existing + received, file_size);
                 break;
             }
             fwrite(buf, 1, nr, fp);
             received += nr;
-            printf("Downloaded: %u / %u bytes\r", received, file_size);
+            printf("Downloaded: %u / %u bytes\r", existing + received, file_size);
             fflush(stdout);
         }
         printf("\nFile downloaded: %s -> %s\n", filename, save_path);
