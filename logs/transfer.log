@@ -1,0 +1,6 @@
+2026-05-26 16:29:49 - 127.0.0.1 uploaded test.txt (26 bytes) server_files/test.txt
+2026-05-26 16:29:49 - 127.0.0.1 uploaded test.dat (23 bytes) server_files/test.dat
+2026-05-26 16:29:59 - 127.0.0.1 downloaded test.txt (26 bytes) 127.0.0.1
+2026-05-26 16:29:59 - 127.0.0.1 downloaded test.dat (23 bytes) 127.0.0.1
+2026-05-27 15:54:41 - 127.0.0.1 downloaded test.txt (26 bytes) 127.0.0.1
+2026-05-27 15:54:50 - 127.0.0.1 downloaded 123.dat (1073741824 bytes) 127.0.0.1
