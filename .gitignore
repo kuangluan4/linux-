@@ -1,0 +1,12 @@
+# 编译产物
+*.o
+*.out
+*.exe
+
+# 运行时生成的文件
+server_files/
+client_files/
+logs/
+
+# 其他
+.DS_Store
